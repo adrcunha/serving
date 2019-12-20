@@ -1,0 +1,36 @@
+timeout: 3600s
+logsBucket: 'gs://adrcunha-flex-test-cb'
+steps:
+- name: 'gcr.io/knative-tests/test-infra/prow-tests-go112:stable'
+  id: 'setup'
+  entrypoint: 'bash'
+  args:
+  - '-c'
+  - |
+    set -ex
+    # Hacky. There must be a better way.
+    export GOPATH=/workspace/go
+    mkdir -p $$GOPATH/src/knative.dev
+    cd $$GOPATH/src/knative.dev
+    git clone -b $BRANCH_NAME https://github.com/adrcunha/$REPO_NAME serving
+    cd serving
+    git checkout $COMMIT_SHA
+
+- name: 'gcr.io/knative-tests/test-infra/prow-tests-go112:stable'
+  id: 'e2e'
+  waitFor: ['setup']
+  entrypoint: 'bash'
+  args:
+  - '-c'
+  - |
+    set -ex
+    export GOPATH=/workspace/go
+    # hack for making the script happy, shouldn't be required
+    export PULL_BASE_REF=bogus_base_ref
+    # dont set PROW_JOB_ID, we don't have Boskos
+    export BUILD_NUMBER=4321
+    #
+    gcloud auth list
+    export PROJECT_ID=knative-boskos-staging-02
+    cd $$GOPATH/src/knative.dev/serving
+    ./test/presubmit-tests.sh --integration-tests

@@ -15,6 +15,7 @@ steps:
     git clone -b $BRANCH_NAME https://github.com/adrcunha/$REPO_NAME serving
     cd serving
     git checkout $COMMIT_SHA
+    go get -u k8s.io/test-infra/kubetest
 
 - name: 'gcr.io/knative-tests/test-infra/prow-tests-go112:stable'
   id: 'e2e'

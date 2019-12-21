@@ -16,7 +16,7 @@ steps:
     cd serving
     git checkout $COMMIT_SHA
     # kubetest from source is broken due to changes in aws-k8s-tester
-    # get it from prow-tests, copy to gobin
+    # can't get from prow-tests because it's in /workspace
     which kubetest || echo "no kubetest in path"
     ls -la /workspace
     cp /workspace/kubetest $$GOPATH/bin/kubetest

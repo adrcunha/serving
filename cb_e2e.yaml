@@ -19,6 +19,7 @@ steps:
     # can't get from prow-tests because it's in /workspace
     which kubetest || echo "no kubetest in path"
     ls -la /workspace
+    mkdir -p $$GOPATH/bin
     cp /workspace/kubetest $$GOPATH/bin/kubetest
 
 - name: 'gcr.io/knative-tests/test-infra/prow-tests:stable'

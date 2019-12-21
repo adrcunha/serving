@@ -1,7 +1,7 @@
 timeout: 3600s
 logsBucket: 'gs://adrcunha-flex-test-cb'
 steps:
-- name: 'gcr.io/knative-tests/test-infra/prow-tests-go112:stable'
+- name: 'gcr.io/knative-tests/test-infra/prow-tests:stable'
   id: 'setup'
   entrypoint: 'bash'
   args:
@@ -15,9 +15,12 @@ steps:
     git clone -b $BRANCH_NAME https://github.com/adrcunha/$REPO_NAME serving
     cd serving
     git checkout $COMMIT_SHA
-    go get -u k8s.io/test-infra/kubetest
+    # kubetest from source is broken due to changes in aws-k8s-tester
+    # get it from prow-tests, copy to gobin
+    which kubetest
+    cp /workspace/kubetest $GOPATH/bin/kubetest
 
-- name: 'gcr.io/knative-tests/test-infra/prow-tests-go112:stable'
+- name: 'gcr.io/knative-tests/test-infra/prow-tests:stable'
   id: 'e2e'
   waitFor: ['setup']
   entrypoint: 'bash'
@@ -32,6 +35,7 @@ steps:
     export BUILD_NUMBER=4321
     #
     gcloud auth list
+    which kubetest
     export PROJECT_ID=knative-boskos-staging-02
     cd $$GOPATH/src/knative.dev/serving
     ./test/presubmit-tests.sh --integration-tests

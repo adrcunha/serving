@@ -17,7 +17,8 @@ steps:
     git checkout $COMMIT_SHA
     # kubetest from source is broken due to changes in aws-k8s-tester
     # get it from prow-tests, copy to gobin
-    which kubetest
+    which kubetest || echo "no kubetest in path"
+    ls -la /workspace
     cp /workspace/kubetest $$GOPATH/bin/kubetest
 
 - name: 'gcr.io/knative-tests/test-infra/prow-tests:stable'
@@ -35,7 +36,7 @@ steps:
     export BUILD_NUMBER=4321
     #
     gcloud auth list
-    which kubetest
+    which kubetest || echo "no kubetest in path"
     export PROJECT_ID=knative-boskos-staging-02
     cd $$GOPATH/src/knative.dev/serving
     ./test/presubmit-tests.sh --integration-tests

@@ -18,7 +18,7 @@ steps:
     # kubetest from source is broken due to changes in aws-k8s-tester
     # get it from prow-tests, copy to gobin
     which kubetest
-    cp /workspace/kubetest $GOPATH/bin/kubetest
+    cp /workspace/kubetest $$GOPATH/bin/kubetest
 
 - name: 'gcr.io/knative-tests/test-infra/prow-tests:stable'
   id: 'e2e'

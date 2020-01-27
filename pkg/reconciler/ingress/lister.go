@@ -19,6 +19,8 @@ package ingress
 import (
 	"context"
 	"fmt"
+	"net/url"
+	"sort"
 	"strconv"
 
 	"go.uber.org/zap"
@@ -55,48 +57,41 @@ type gatewayPodTargetLister struct {
 	serviceLister   corev1listers.ServiceLister
 }
 
-// probeTargets represents the target to probe.
-type probeTarget struct {
-	// urlTmpl is an url template to probe.
-	urlTmpl string
-	// targetPort is a port of Gateway pod.
-	targetPort string
-}
-
-func (l *gatewayPodTargetLister) ListProbeTargets(ctx context.Context, ing *v1alpha1.Ingress) (map[string]map[string]sets.String, error) {
-	results := map[string]map[string]sets.String{}
-
-	qualifiedGatewayNames := qualifiedGatewayNamesFromContext(ctx)
-
-	gatewayHosts := ingress.HostsPerVisibility(ing, qualifiedGatewayNames)
-	for gatewayName, hosts := range gatewayHosts {
+func (l *gatewayPodTargetLister) ListProbeTargets(ctx context.Context, ing *v1alpha1.Ingress) ([]status.ProbeTarget, error) {
+	results := []status.ProbeTarget{}
+	gatewayHosts := ingress.HostsPerVisibility(ing, qualifiedGatewayNamesFromContext(ctx))
+	gatewayNames := []string{}
+	for gatewayName := range gatewayHosts {
+		gatewayNames = append(gatewayNames, gatewayName)
+	}
+	// Sort the gateway names for a consistent ordering.
+	sort.Strings(gatewayNames)
+	for _, gatewayName := range gatewayNames {
 		gateway, err := l.getGateway(gatewayName)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get Gateway %q: %w", gatewayName, err)
 		}
-		targetsPerPod, err := l.listGatewayTargetsPerPods(gateway)
+		targets, err := l.listGatewayTargets(gateway)
 		if err != nil {
 			return nil, fmt.Errorf("failed to list the probing URLs of Gateway %q: %w", gatewayName, err)
 		}
-		if len(targetsPerPod) == 0 {
+		if len(targets) == 0 {
 			continue
 		}
-		for ip, targets := range targetsPerPod {
-			if _, existed := results[ip]; !existed {
-				results[ip] = map[string]sets.String{}
+		for _, target := range targets {
+			qualifiedTarget := status.ProbeTarget{
+				PodIPs:  target.PodIPs,
+				PodPort: target.PodPort,
+				Port:    target.Port,
+				URLs:    make([]*url.URL, len(gatewayHosts[gatewayName])),
 			}
-			// Use sorted host for consistent ordering.
-			for _, host := range hosts.List() {
-				for _, target := range targets {
-					url := fmt.Sprintf(target.urlTmpl, host)
-
-					if targets, existed := results[ip][target.targetPort]; existed {
-						targets.Insert(url)
-					} else {
-						results[ip][target.targetPort] = sets.NewString(url)
-					}
-				}
+			// Use sorted hosts list for consistent ordering.
+			for i, host := range gatewayHosts[gatewayName].List() {
+				newURL := *target.URLs[0]
+				newURL.Host = host + ":" + target.Port
+				qualifiedTarget.URLs[i] = &newURL
 			}
+			results = append(results, qualifiedTarget)
 		}
 	}
 	return results, nil
@@ -113,9 +108,8 @@ func (l *gatewayPodTargetLister) getGateway(name string) (*v1alpha3.Gateway, err
 	return l.gatewayLister.Gateways(namespace).Get(name)
 }
 
-// listGatewayPodsURLs returns a map where the keys are the Gateway Pod IPs and the values are the corresponding
-// URL templates and the Gateway Pod Port to be probed.
-func (l *gatewayPodTargetLister) listGatewayTargetsPerPods(gateway *v1alpha3.Gateway) (map[string][]probeTarget, error) {
+// listGatewayPodsURLs returns a probe targets for a given Gateway.
+func (l *gatewayPodTargetLister) listGatewayTargets(gateway *v1alpha3.Gateway) ([]status.ProbeTarget, error) {
 	selector := labels.SelectorFromSet(gateway.Spec.Selector)
 
 	services, err := l.serviceLister.List(selector)
@@ -133,18 +127,18 @@ func (l *gatewayPodTargetLister) listGatewayTargetsPerPods(gateway *v1alpha3.Gat
 		return nil, fmt.Errorf("failed to get Endpoints: %w", err)
 	}
 
-	targetsPerPods := make(map[string][]probeTarget)
+	targets := []status.ProbeTarget{}
 	for _, server := range gateway.Spec.Servers {
-		var urlTmpl string
+		tURL := &url.URL{}
 		switch server.Port.Protocol {
 		case "HTTP", "HTTP2":
 			if server.Tls != nil && server.Tls.HttpsRedirect {
 				// ignoring HTTPS redirects.
 				continue
 			}
-			urlTmpl = "http://%%s:%d/"
+			tURL.Scheme = "http"
 		case "HTTPS":
-			urlTmpl = "https://%%s:%d/"
+			tURL.Scheme = "https"
 		default:
 			l.logger.Infof("Skipping Server %q because protocol %q is not supported", server.Port.Name, server.Port.Protocol)
 			continue
@@ -156,17 +150,26 @@ func (l *gatewayPodTargetLister) listGatewayTargetsPerPods(gateway *v1alpha3.Gat
 			continue
 		}
 		for _, sub := range endpoints.Subsets {
+			// The translation from server.Port.Number -> portName -> portNumber is intentional.
+			// We can't simply translate from the Service.Spec because Service.Spec.Target.Port
+			// could be either a name or a number.  In the Endpoints spec, all ports are provided
+			// as numbers.
 			portNumber, err := network.PortNumberForName(sub, portName)
 			if err != nil {
-				l.logger.Infof("Skipping Subset %v because it doesn't contain a port %q", sub.Addresses, portName)
+				l.logger.Infof("Skipping Subset %v because it doesn't contain a port name %q", sub.Addresses, portName)
 				continue
 			}
-			portNumberStr := strconv.Itoa(int(portNumber))
-			url := fmt.Sprintf(urlTmpl, server.Port.Number)
-			for _, addr := range sub.Addresses {
-				targetsPerPods[addr.IP] = append(targetsPerPods[addr.IP], probeTarget{urlTmpl: url, targetPort: portNumberStr})
+			target := status.ProbeTarget{
+				PodIPs:  sets.NewString(),
+				PodPort: strconv.Itoa(int(portNumber)),
+				Port:    strconv.Itoa(int(server.Port.Number)),
+				URLs:    []*url.URL{tURL},
 			}
+			for _, addr := range sub.Addresses {
+				target.PodIPs.Insert(addr.IP)
+			}
+			targets = append(targets, target)
 		}
 	}
-	return targetsPerPods, nil
+	return targets, nil
 }

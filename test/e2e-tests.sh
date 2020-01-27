@@ -52,12 +52,16 @@ go_test_e2e -timeout=30m \
   ./test/conformance/... \
   ./test/e2e \
   ${parallelism} \
-  "--resolvabledomain=$(use_resolvable_domain)" "$(use_https)" || failed=1
+  "--resolvabledomain=$(use_resolvable_domain)" "$(use_https)" "$(ingress_class)" || failed=1
 
 # Run scale tests.
 go_test_e2e -timeout=10m \
   ${parallelism} \
   ./test/scale || failed=1
+
+# Auto TLS E2E tests mutate the cluster and must be ran separately
+go_test_e2e -timeout=10m \
+  ./test/e2e/autotls || failed=1
 
 # Istio E2E tests mutate the cluster and must be ran separately
 if [[ -n "${ISTIO_VERSION}" ]]; then

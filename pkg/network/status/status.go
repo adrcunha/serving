@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -47,14 +48,16 @@ const (
 	stateExpiration = 5 * time.Minute
 	// cleanupPeriod defines how often states are cleaned up
 	cleanupPeriod = 1 * time.Minute
+	//probeTimeout defines the maximum amount of time a request will wait
+	probeTimeout = 1 * time.Second
 )
 
-var dialContext = (&net.Dialer{}).DialContext
+var dialContext = (&net.Dialer{Timeout: probeTimeout}).DialContext
 
-// ingressState represents the probing progress at the Ingress scope
+// ingressState represents the probing state of an Ingress
 type ingressState struct {
 	hash string
-	ia   *v1alpha1.Ingress
+	ing  *v1alpha1.Ingress
 
 	// pendingCount is the number of pods that haven't been successfully probed yet
 	pendingCount int32
@@ -63,10 +66,16 @@ type ingressState struct {
 	cancel func()
 }
 
-// podState represents the probing progress at the Pod scope
+// podState represents the probing state of a Pod (for a specific Ingress)
 type podState struct {
+	// successCount is the number of successful probes
 	successCount int32
 
+	cancel func()
+}
+
+// cancelContext is a pair of a Context and its cancel function
+type cancelContext struct {
 	context context.Context
 	cancel  func()
 }
@@ -74,21 +83,29 @@ type podState struct {
 type workItem struct {
 	ingressState *ingressState
 	podState     *podState
-	url          string
+	context      context.Context
+	url          *url.URL
 	podIP        string
 	podPort      string
 }
 
+// ProbeTarget contains the URLs to probes for a set of Pod IPs serving out of the same port.
+type ProbeTarget struct {
+	PodIPs  sets.String
+	PodPort string
+	Port    string
+	URLs    []*url.URL
+}
+
 // ProbeTargetLister lists all the targets that requires probing.
 type ProbeTargetLister interface {
-
-	// ListProbeTargets returns the target to be probed as a map from podIP -> port -> urls.
-	ListProbeTargets(ctx context.Context, ingress *v1alpha1.Ingress) (map[string]map[string]sets.String, error)
+	// ListProbeTargets returns a list of targets to be probed.
+	ListProbeTargets(ctx context.Context, ingress *v1alpha1.Ingress) ([]ProbeTarget, error)
 }
 
 // Manager provides a way to check if an Ingress is ready
 type Manager interface {
-	IsReady(ctx context.Context, ia *v1alpha1.Ingress) (bool, error)
+	IsReady(ctx context.Context, ing *v1alpha1.Ingress) (bool, error)
 }
 
 // Prober provides a way to check if a VirtualService is ready by probing the Envoy pods
@@ -96,10 +113,10 @@ type Manager interface {
 type Prober struct {
 	logger *zap.SugaredLogger
 
-	// mu guards ingressStates and podStates
+	// mu guards ingressStates and podContexts
 	mu            sync.Mutex
 	ingressStates map[string]*ingressState
-	podStates     map[string]*podState
+	podContexts   map[string]cancelContext
 
 	workQueue workqueue.RateLimitingInterface
 
@@ -120,7 +137,7 @@ func NewProber(
 	return &Prober{
 		logger:        logger,
 		ingressStates: make(map[string]*ingressState),
-		podStates:     make(map[string]*podState),
+		podContexts:   make(map[string]cancelContext),
 		workQueue: workqueue.NewNamedRateLimitingQueue(
 			workqueue.DefaultControllerRateLimiter(),
 			"ProbingQueue"),
@@ -141,10 +158,10 @@ func ingressKey(ing *v1alpha1.Ingress) string {
 // will be called in the order of reconciliation. This means that if IsReady is called on an Ingress,
 // this Ingress is the latest known version and therefore anything related to older versions can be ignored.
 // Also, it means that IsReady is not called concurrently.
-func (m *Prober) IsReady(ctx context.Context, ia *v1alpha1.Ingress) (bool, error) {
-	ingressKey := ingressKey(ia)
+func (m *Prober) IsReady(ctx context.Context, ing *v1alpha1.Ingress) (bool, error) {
+	ingressKey := ingressKey(ing)
 
-	bytes, err := ingress.ComputeHash(ia)
+	bytes, err := ingress.ComputeHash(ing)
 	if err != nil {
 		return false, fmt.Errorf("failed to compute the hash of the Ingress: %w", err)
 	}
@@ -171,95 +188,125 @@ func (m *Prober) IsReady(ctx context.Context, ia *v1alpha1.Ingress) (bool, error
 	ingCtx, cancel := context.WithCancel(context.Background())
 	ingressState := &ingressState{
 		hash:         hash,
-		ia:           ia,
+		ing:          ing,
 		lastAccessed: time.Now(),
 		cancel:       cancel,
 	}
 
-	var workItems []*workItem
-
-	allProbeTargets, err := m.targetLister.ListProbeTargets(ctx, ia)
+	// Get the probe targets and group them by IP
+	targets, err := m.targetLister.ListProbeTargets(ctx, ing)
 	if err != nil {
 		return false, err
 	}
+	workItems := make(map[string][]*workItem)
+	for _, target := range targets {
+		for ip := range target.PodIPs {
+			for _, url := range target.URLs {
+				workItems[ip] = append(workItems[ip], &workItem{
+					ingressState: ingressState,
+					url:          url,
+					podIP:        ip,
+					podPort:      target.PodPort,
+				})
+			}
+		}
+	}
 
-	for ip, targets := range allProbeTargets {
-		// Each Pod is probed using the different hosts, protocol and ports until
-		// one of the probing calls succeeds. Then, the Pod is considered ready and all pending work items
-		// scheduled for that pod are cancelled.
-		ctx, cancel := context.WithCancel(ingCtx)
+	ingressState.pendingCount = int32(len(workItems))
+
+	for ip, ipWorkItems := range workItems {
+		// Get or create the context for that IP
+		ipCtx := func() context.Context {
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			cancelCtx, ok := m.podContexts[ip]
+			if !ok {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancelCtx = cancelContext{
+					context: ctx,
+					cancel:  cancel,
+				}
+				m.podContexts[ip] = cancelCtx
+			}
+			return cancelCtx.context
+		}()
+
+		podCtx, cancel := context.WithCancel(ingCtx)
 		podState := &podState{
 			successCount: 0,
-			context:      ctx,
 			cancel:       cancel,
 		}
 
-		// Save the podState to be able to cancel it in case of Pod deletion
-		func() {
-			m.mu.Lock()
-			defer m.mu.Unlock()
-			m.podStates[ip] = podState
+		// Quick and dirty way to join two contexts (i.e. podCtx is cancelled when either ingCtx or ipCtx are cancelled)
+		go func() {
+			select {
+			case <-podCtx.Done():
+				// This is the actual context, there is nothing to do except
+				// break to avoid leaking this goroutine.
+				break
+			case <-ipCtx.Done():
+				// Cancel podCtx
+				cancel()
+			}
 		}()
 
-		// Update states and cleanup m.podStates when probing is done or cancelled
-		go func(ip string) {
-			<-podState.context.Done()
+		// Update the states when probing is successful or cancelled
+		go func() {
+			<-podCtx.Done()
 			m.updateStates(ingressState, podState)
+		}()
 
-			m.mu.Lock()
-			defer m.mu.Unlock()
-			// It is critical to check that the current podState is also the one stored in the map
-			// before deleting it because it could have been replaced if a new version of the ingress
-			// has started being probed.
-			if state, ok := m.podStates[ip]; ok && state == podState {
-				delete(m.podStates, ip)
-			}
-		}(ip)
-
-		for port, urls := range targets {
-			for _, url := range urls.List() {
-				workItem := &workItem{
-					ingressState: ingressState,
-					podState:     podState,
-					url:          url,
-					podIP:        ip,
-					podPort:      port,
-				}
-				workItems = append(workItems, workItem)
-			}
+		for _, wi := range ipWorkItems {
+			wi.podState = podState
+			wi.context = podCtx
+			m.workQueue.AddRateLimited(wi)
+			m.logger.Infof("Queuing probe for %s, IP: %s:%s (depth: %d)",
+				wi.url, wi.podIP, wi.podPort, m.workQueue.Len())
 		}
-		ingressState.pendingCount++
 	}
+
 	func() {
 		m.mu.Lock()
 		defer m.mu.Unlock()
 		m.ingressStates[ingressKey] = ingressState
 	}()
-	for _, workItem := range workItems {
-		m.workQueue.AddRateLimited(workItem)
-		m.logger.Infof("Queuing probe for %s, IP: %s:%s (depth: %d)", workItem.url, workItem.podIP, workItem.podPort, m.workQueue.Len())
-	}
 	return len(workItems) == 0, nil
 }
 
 // Start starts the Manager background operations
-func (m *Prober) Start(done <-chan struct{}) {
+func (m *Prober) Start(done <-chan struct{}) chan struct{} {
+	var wg sync.WaitGroup
+
 	// Start the worker goroutines
 	for i := 0; i < m.probeConcurrency; i++ {
+		wg.Add(1)
 		go func() {
+			defer wg.Done()
 			for m.processWorkItem() {
 			}
 		}()
 	}
 
 	// Cleanup the states periodically
-	go wait.Until(m.expireOldStates, m.cleanupPeriod, done)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		wait.Until(m.expireOldStates, m.cleanupPeriod, done)
+	}()
 
 	// Stop processing the queue when cancelled
 	go func() {
 		<-done
 		m.workQueue.ShutDown()
 	}()
+
+	// Return a channel closed when all work is done
+	ch := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(ch)
+	}()
+	return ch
 }
 
 // CancelIngressProbing cancels probing of the provided Ingress
@@ -285,8 +332,9 @@ func (m *Prober) CancelPodProbing(obj interface{}) {
 		m.mu.Lock()
 		defer m.mu.Unlock()
 
-		if state, ok := m.podStates[pod.Status.PodIP]; ok {
-			state.cancel()
+		if ctx, ok := m.podContexts[pod.Status.PodIP]; ok {
+			ctx.cancel()
+			delete(m.podContexts, pod.Status.PodIP)
 		}
 	}
 }
@@ -316,9 +364,11 @@ func (m *Prober) processWorkItem() bool {
 	// Crash if the item is not of the expected type
 	item, ok := obj.(*workItem)
 	if !ok {
-		m.logger.Fatalf("Unexpected work item type: want: %s, got: %s\n", reflect.TypeOf(&workItem{}).Name(), reflect.TypeOf(obj).Name())
+		m.logger.Fatalf("Unexpected work item type: want: %s, got: %s\n",
+			reflect.TypeOf(&workItem{}).Name(), reflect.TypeOf(obj).Name())
 	}
-	m.logger.Infof("Processing probe for %s, IP: %s:%s (depth: %d)", item.url, item.podIP, item.podPort, m.workQueue.Len())
+	m.logger.Infof("Processing probe for %s, IP: %s:%s (depth: %d)",
+		item.url, item.podIP, item.podPort, m.workQueue.Len())
 
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{
@@ -335,16 +385,16 @@ func (m *Prober) processWorkItem() bool {
 		}}
 
 	ok, err := prober.Do(
-		item.podState.context,
+		item.context,
 		transport,
-		item.url,
+		item.url.String(),
 		prober.WithHeader(network.ProbeHeaderName, network.ProbeHeaderValue),
 		prober.ExpectsStatusCodes([]int{http.StatusOK}),
 		prober.ExpectsHeader(network.HashHeaderName, item.ingressState.hash))
 
 	// In case of cancellation, drop the work item
 	select {
-	case <-item.podState.context.Done():
+	case <-item.context.Done():
 		m.workQueue.Forget(obj)
 		return true
 	default:
@@ -353,7 +403,8 @@ func (m *Prober) processWorkItem() bool {
 	if err != nil || !ok {
 		// In case of error, enqueue for retry
 		m.workQueue.AddRateLimited(obj)
-		m.logger.Errorf("Probing of %s failed, IP: %s:%s, ready: %t, error: %v (depth: %d)", item.url, item.podIP, item.podPort, ok, err, m.workQueue.Len())
+		m.logger.Errorf("Probing of %s failed, IP: %s:%s, ready: %t, error: %v (depth: %d)",
+			item.url, item.podIP, item.podPort, ok, err, m.workQueue.Len())
 	} else {
 		m.updateStates(item.ingressState, item.podState)
 	}
@@ -367,7 +418,7 @@ func (m *Prober) updateStates(ingressState *ingressState, podState *podState) {
 
 		// This is the last pod being successfully probed, the Ingress is ready
 		if atomic.AddInt32(&ingressState.pendingCount, -1) == 0 {
-			m.readyCallback(ingressState.ia)
+			m.readyCallback(ingressState.ing)
 		}
 	}
 }

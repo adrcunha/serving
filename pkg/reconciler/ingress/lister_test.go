@@ -20,6 +20,8 @@ import (
 	"context"
 	"errors"
 	"log"
+	"net/url"
+	"sort"
 	"strings"
 	"testing"
 
@@ -27,6 +29,7 @@ import (
 	istiov1alpha3 "istio.io/api/networking/v1alpha3"
 	v1alpha3 "istio.io/client-go/pkg/apis/networking/v1alpha3"
 	"knative.dev/serving/pkg/apis/networking/v1alpha1"
+	"knative.dev/serving/pkg/network/status"
 	"knative.dev/serving/pkg/reconciler/ingress/config"
 
 	"go.uber.org/zap/zaptest"
@@ -48,7 +51,7 @@ func TestListProbeTargets(t *testing.T) {
 		endpointsLister corev1listers.EndpointsLister
 		serviceLister   corev1listers.ServiceLister
 		errMessage      string
-		results         map[string]map[string]sets.String
+		results         []status.ProbeTarget
 	}{{
 		name: "unqualified gateway",
 		ingressGateways: []config.Gateway{{
@@ -425,6 +428,100 @@ func TestListProbeTargets(t *testing.T) {
 						Hosts: []string{"*"},
 						Port: &istiov1alpha3.Port{
 							Name:     "http",
+							Number:   8080,
+							Protocol: "HTTP",
+						},
+					}, {
+						Hosts: []string{"*"},
+						Port: &istiov1alpha3.Port{
+							Name:     "https",
+							Number:   443,
+							Protocol: "HTTPS",
+						},
+					}},
+					Selector: map[string]string{
+						"gwt": "istio",
+					},
+				},
+			}},
+		},
+		endpointsLister: &fakeEndpointsLister{
+			endpointses: []*v1.Endpoints{{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "gateway",
+				},
+				Subsets: []v1.EndpointSubset{{
+					Ports: []v1.EndpointPort{{
+						Name: "bogus",
+						Port: 8081,
+					}, {
+						Name: "real",
+						Port: 8080,
+					}},
+					Addresses: []v1.EndpointAddress{{
+						IP: "1.1.1.1",
+					}},
+				}},
+			}},
+		},
+		serviceLister: &fakeServiceLister{
+			services: []*v1.Service{{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "gateway",
+					Labels: map[string]string{
+						"gwt": "istio",
+					},
+				},
+				Spec: v1.ServiceSpec{
+					Ports: []v1.ServicePort{{
+						Name: "bogus",
+						Port: 8081,
+					}, {
+						Name: "real",
+						Port: 8080,
+					}},
+				},
+			}},
+		},
+		ingress: &v1alpha1.Ingress{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "default",
+				Name:      "whatever",
+			},
+			Spec: v1alpha1.IngressSpec{
+				Rules: []v1alpha1.IngressRule{{
+					Hosts: []string{
+						"foo.bar.com",
+					},
+					Visibility: v1alpha1.IngressVisibilityExternalIP,
+				}},
+			},
+		},
+		results: []status.ProbeTarget{{
+			PodIPs:  sets.NewString("1.1.1.1"),
+			PodPort: "8080",
+			Port:    "8080",
+			URLs:    []*url.URL{{Scheme: "http", Host: "foo.bar.com:8080"}},
+		}},
+	}, {
+		name: "Different port between endpoint and gateway service",
+		ingressGateways: []config.Gateway{{
+			Name:      "gateway",
+			Namespace: "default",
+		}},
+		gatewayLister: &fakeGatewayLister{
+			gateways: []*v1alpha3.Gateway{{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "gateway",
+				},
+				Spec: istiov1alpha3.Gateway{
+					Servers: []*istiov1alpha3.Server{{
+						Hosts: []string{"*"},
+						Port: &istiov1alpha3.Port{
+							Name:     "http",
 							Number:   80,
 							Protocol: "HTTP",
 						},
@@ -451,10 +548,10 @@ func TestListProbeTargets(t *testing.T) {
 				Subsets: []v1.EndpointSubset{{
 					Ports: []v1.EndpointPort{{
 						Name: "bogus",
-						Port: 8080,
+						Port: 8081,
 					}, {
 						Name: "real",
-						Port: 80,
+						Port: 8080, // Different port number between Endpoint and Gateway Service.
 					}},
 					Addresses: []v1.EndpointAddress{{
 						IP: "1.1.1.1",
@@ -474,7 +571,7 @@ func TestListProbeTargets(t *testing.T) {
 				Spec: v1.ServiceSpec{
 					Ports: []v1.ServicePort{{
 						Name: "bogus",
-						Port: 8080,
+						Port: 8081,
 					}, {
 						Name: "real",
 						Port: 80,
@@ -496,11 +593,12 @@ func TestListProbeTargets(t *testing.T) {
 				}},
 			},
 		},
-		results: map[string]map[string]sets.String{
-			"1.1.1.1": map[string]sets.String{
-				"80": sets.NewString("http://foo.bar.com:80/"),
-			},
-		},
+		results: []status.ProbeTarget{{
+			PodIPs:  sets.NewString("1.1.1.1"),
+			PodPort: "8080",
+			Port:    "80",
+			URLs:    []*url.URL{{Scheme: "http", Host: "foo.bar.com:80"}},
+		}},
 	}, {
 		name: "one gateway, https redirect",
 		ingressGateways: []config.Gateway{{
@@ -592,7 +690,7 @@ func TestListProbeTargets(t *testing.T) {
 				}},
 			},
 		},
-		results: map[string]map[string]sets.String{},
+		results: []status.ProbeTarget{},
 	}, {
 		name: "unsupported protocols",
 		ingressGateways: []config.Gateway{{
@@ -674,7 +772,7 @@ func TestListProbeTargets(t *testing.T) {
 				}},
 			},
 		},
-		results: map[string]map[string]sets.String{},
+		results: []status.ProbeTarget{},
 	}, {
 		name: "subsets with no ports",
 		ingressGateways: []config.Gateway{{
@@ -753,7 +851,7 @@ func TestListProbeTargets(t *testing.T) {
 				}},
 			},
 		},
-		results: map[string]map[string]sets.String{},
+		results: []status.ProbeTarget{},
 	}, {
 		name: "two gateways",
 		ingressGateways: []config.Gateway{{
@@ -892,17 +990,17 @@ func TestListProbeTargets(t *testing.T) {
 				}},
 			},
 		},
-		results: map[string]map[string]sets.String{
-			"1.1.1.1": map[string]sets.String{
-				"80": sets.NewString("http://foo.bar.com:80/"),
-			},
-			"2.2.2.2": map[string]sets.String{
-				"90": sets.NewString("http://foo.bar.com:90/"),
-			},
-			"2.2.2.3": map[string]sets.String{
-				"90": sets.NewString("http://foo.bar.com:90/"),
-			},
-		},
+		results: []status.ProbeTarget{{
+			PodIPs:  sets.NewString("1.1.1.1"),
+			PodPort: "80",
+			Port:    "80",
+			URLs:    []*url.URL{{Scheme: "http", Host: "foo.bar.com:80"}},
+		}, {
+			PodIPs:  sets.NewString("2.2.2.2", "2.2.2.3"),
+			PodPort: "90",
+			Port:    "90",
+			URLs:    []*url.URL{{Scheme: "http", Host: "foo.bar.com:90"}},
+		}},
 	}, {
 		name: "local gateways",
 		localGateways: []config.Gateway{{
@@ -1045,18 +1143,15 @@ func TestListProbeTargets(t *testing.T) {
 				}},
 			},
 		},
-		results: map[string]map[string]sets.String{
-			"2.2.2.2": map[string]sets.String{
-				"80": sets.NewString("http://foo.bar.svc.cluster.local:80/",
-					"http://foo.bar.svc:80/",
-					"http://foo.bar:80/"),
-			},
-			"2.2.2.3": map[string]sets.String{
-				"80": sets.NewString("http://foo.bar.svc.cluster.local:80/",
-					"http://foo.bar.svc:80/",
-					"http://foo.bar:80/"),
-			},
-		},
+		results: []status.ProbeTarget{{
+			PodIPs:  sets.NewString("2.2.2.2", "2.2.2.3"),
+			PodPort: "80",
+			Port:    "80",
+			URLs: []*url.URL{
+				{Scheme: "http", Host: "foo.bar:80"},
+				{Scheme: "http", Host: "foo.bar.svc:80"},
+				{Scheme: "http", Host: "foo.bar.svc.cluster.local:80"}},
+		}},
 	}}
 
 	for _, test := range tests {
@@ -1081,9 +1176,13 @@ func TestListProbeTargets(t *testing.T) {
 			} else if !strings.Contains(err.Error(), test.errMessage) {
 				t.Errorf("expected error message %q but saw %v", test.errMessage, err)
 			}
-			if 0 != len(test.results)+len(results) { // consider nil map == empty map
+			if len(test.results)+len(results) > 0 { // consider nil map == empty map
+				// Sort by port number
+				sort.Slice(results, func(i, j int) bool {
+					return results[i].Port < results[j].Port
+				})
 				if diff := cmp.Diff(test.results, results); diff != "" {
-					t.Errorf("Unexpected probe targets (-want +got): %v", diff)
+					t.Errorf("Unexpected probe targets (-want +got): %s", diff)
 				}
 			}
 		})

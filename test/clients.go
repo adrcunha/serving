@@ -74,13 +74,15 @@ type ServingClients struct {
 // networking clients.
 type NetworkingClients struct {
 	ServerlessServices networkingv1alpha1.ServerlessServiceInterface
+	Ingresses          networkingv1alpha1.IngressInterface
+	Certificates       networkingv1alpha1.CertificateInterface
 }
 
 // NewClients instantiates and returns several clientsets required for making request to the
 // Knative Serving cluster specified by the combination of clusterName and configPath. Clients can
 // make requests within namespace.
 func NewClients(configPath string, clusterName string, namespace string) (*Clients, error) {
-	cfg, err := buildClientConfig(configPath, clusterName)
+	cfg, err := BuildClientConfig(configPath, clusterName)
 	if err != nil {
 		return nil, err
 	}
@@ -144,6 +146,8 @@ func newNetworkingClients(cfg *rest.Config, namespace string) (*NetworkingClient
 	}
 	return &NetworkingClients{
 		ServerlessServices: cs.NetworkingV1alpha1().ServerlessServices(namespace),
+		Ingresses:          cs.NetworkingV1alpha1().Ingresses(namespace),
+		Certificates:       cs.NetworkingV1alpha1().Certificates(namespace),
 	}, nil
 }
 
@@ -233,7 +237,8 @@ func (clients *ServingAlphaClients) Delete(routes []string, configs []string, se
 	return nil
 }
 
-func buildClientConfig(kubeConfigPath string, clusterName string) (*rest.Config, error) {
+// BuildClientConfig builds client config for testing.
+func BuildClientConfig(kubeConfigPath string, clusterName string) (*rest.Config, error) {
 	overrides := clientcmd.ConfigOverrides{}
 	// Override the cluster name if provided.
 	if clusterName != "" {
